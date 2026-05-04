@@ -13,14 +13,9 @@ import (
 )
 
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (id, created_at, updated_at, name)/*  */
-VALUES (
-    $1,
-    $2,
-    $3,
-    $4
-)
-RETURNING id, name, created_at, updated_at
+INSERT INTO users (id, created_at, updated_at, name)
+VALUES ($1, $2, $3, $4)
+RETURNING id, created_at, updated_at, name
 `
 
 type CreateUserParams struct {
@@ -40,16 +35,15 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.Name,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Name,
 	)
 	return i, err
 }
 
 const deleteUser = `-- name: DeleteUser :exec
-DELETE FROM users
-WHERE id = $1
+DELETE FROM users WHERE id = $1
 `
 
 func (q *Queries) DeleteUser(ctx context.Context, id uuid.UUID) error {
@@ -58,8 +52,7 @@ func (q *Queries) DeleteUser(ctx context.Context, id uuid.UUID) error {
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, name, created_at, updated_at FROM users
-WHERE id = $1 LIMIT 1
+SELECT id, created_at, updated_at, name FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
@@ -67,16 +60,15 @@ func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.Name,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Name,
 	)
 	return i, err
 }
 
 const getUserByName = `-- name: GetUserByName :one
-SELECT id, name, created_at, updated_at FROM users
-WHERE name = $1 LIMIT 1
+SELECT id, created_at, updated_at, name FROM users WHERE name = $1
 `
 
 func (q *Queries) GetUserByName(ctx context.Context, name string) (User, error) {
@@ -84,16 +76,15 @@ func (q *Queries) GetUserByName(ctx context.Context, name string) (User, error) 
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.Name,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Name,
 	)
 	return i, err
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, name, created_at, updated_at FROM users
-ORDER BY name
+SELECT id, created_at, updated_at, name FROM users
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -107,9 +98,9 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		var i User
 		if err := rows.Scan(
 			&i.ID,
-			&i.Name,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Name,
 		); err != nil {
 			return nil, err
 		}
@@ -122,21 +113,4 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
-}
-
-const updateUser = `-- name: UpdateUser :exec
-UPDATE users
-SET name = $2, updated_at = $3
-WHERE id = $1
-`
-
-type UpdateUserParams struct {
-	ID        uuid.UUID
-	Name      string
-	UpdatedAt time.Time
-}
-
-func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) error {
-	_, err := q.db.ExecContext(ctx, updateUser, arg.ID, arg.Name, arg.UpdatedAt)
-	return err
 }

@@ -190,15 +190,13 @@ func handlerAddFeed(state *State, command Command) error {
 
 	currentUserName := state.Config.GetUser()
 	if currentUserName == "" {
-		fmt.Fprintln(os.Stderr, "error: no current user configured")
-		os.Exit(1)
+		return fmt.Errorf("no current user configured")
 	}
 
 	user, err := state.Queries.GetUserByName(context.Background(), currentUserName)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			fmt.Fprintf(os.Stderr, "error: current user '%s' not found\n", currentUserName)
-			os.Exit(1)
+			return fmt.Errorf("current user '%s' not found", currentUserName)
 		}
 		return fmt.Errorf("failed to lookup current user: %w", err)
 	}
@@ -218,13 +216,25 @@ func handlerAddFeed(state *State, command Command) error {
 		return fmt.Errorf("failed to create feed: %w", err)
 	}
 
-	fmt.Printf("Feed created successfully: %+v\n", feed)
+	// Automatically follow the newly created feed for the user
+	_, err = state.Queries.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: now,
+		UpdatedAt: now,
+		UserID:    user.ID,
+		FeedID:    feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to automatically follow created feed: %w", err)
+	}
+
+	fmt.Printf("Feed '%s' created and followed successfully.\n", feed.Name)
 	return nil
 }
 
 // handlerFeeds implements the "feeds" command. It displays all feeds in the database.
 func handlerFeeds(state *State, command Command) error {
-	feeds, err := state.Queries.ListFeeds(context.Background())
+	feeds, err := state.Queries.GetFeedsWithUser(context.Background())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to retrieve feeds: %v\n", err)
 		os.Exit(1)
@@ -236,15 +246,9 @@ func handlerFeeds(state *State, command Command) error {
 	}
 
 	for _, feed := range feeds {
-		user, err := state.Queries.GetUserByID(context.Background(), feed.UserID)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to get user for feed '%s': %v\n", feed.Name, err)
-			os.Exit(1)
-		}
-
 		fmt.Printf("* %s\n", feed.Name)
 		fmt.Printf("  URL: %s\n", feed.Url)
-		fmt.Printf("  User: %s\n", user.Name)
+		fmt.Printf("  User: %s\n", feed.UserName)
 		fmt.Println()
 	}
 	return nil
@@ -293,6 +297,89 @@ func handlerAgg(state *State, command Command) error {
 	return nil
 }
 
+// handlerFollow implements the "follow" command. It creates a feed follow record for the current user.
+func handlerFollow(state *State, command Command) error {
+	if len(command.Args) < 1 {
+		return fmt.Errorf("usage: follow <url>")
+	}
+
+	feedURL := command.Args[0]
+
+	currentUserName := state.Config.GetUser()
+	if currentUserName == "" {
+		fmt.Fprintln(os.Stderr, "error: no current user configured")
+		os.Exit(1)
+	}
+
+	user, err := state.Queries.GetUserByName(context.Background(), currentUserName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			fmt.Fprintf(os.Stderr, "error: current user '%s' not found\n", currentUserName)
+			os.Exit(1)
+		}
+		return fmt.Errorf("failed to lookup current user: %w", err)
+	}
+
+	feed, err := state.Queries.GetFeedByURL(context.Background(), feedURL)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			fmt.Fprintf(os.Stderr, "error: feed with URL '%s' not found\n", feedURL)
+			os.Exit(1)
+		}
+		return fmt.Errorf("failed to lookup feed: %w", err)
+	}
+
+	now := time.Now().UTC()
+	id := uuid.New()
+
+	_, err = state.Queries.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{
+		ID:        id,
+		CreatedAt: now,
+		UpdatedAt: now,
+		FeedID:    feed.ID,
+		UserID:    user.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create feed follow: %w", err)
+	}
+
+	fmt.Printf("Feed '%s' followed by '%s'\n", feed.Name, user.Name)
+	return nil
+}
+
+// handlerFollowing implements the "following" command. It displays all feeds the current user is following.
+func handlerFollowing(state *State, command Command) error {
+	currentUserName := state.Config.GetUser()
+	if currentUserName == "" {
+		return fmt.Errorf("no current user configured")
+	}
+
+	user, err := state.Queries.GetUserByName(context.Background(), currentUserName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("current user '%s' not found", currentUserName)
+		}
+		return fmt.Errorf("failed to lookup current user: %w", err)
+	}
+
+	follows, err := state.Queries.GetFeedFollowsForUser(context.Background(), user.ID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to retrieve feed follows: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(follows) == 0 {
+		fmt.Println("No feeds being followed.")
+		return nil
+	}
+
+	fmt.Printf("Feeds followed by %s:\n", currentUserName)
+	for _, follow := range follows {
+		fmt.Printf("* %s\n", follow.FeedName)
+	}
+	return nil
+}
+
 // main is the entry point of the application.
 func main() {
 	cfg, err := config.ReadConfig()
@@ -315,12 +402,14 @@ func main() {
 		Handlers: make(map[string]func(*State, Command) error),
 	}
 	cmds.AddHandler("login", handlerLogin)
-	cmds.AddHandler("register", handlerRegister) // Register the new handler
-	cmds.AddHandler("reset", handlerReset)       // Register the reset handler
-	cmds.AddHandler("users", handlerUsers)       // Register the users handler
-	cmds.AddHandler("agg", handlerAgg)           // Register the agg handler
-	cmds.AddHandler("addfeed", handlerAddFeed)   // Register the addfeed handler
-	cmds.AddHandler("feeds", handlerFeeds)       // Register the feeds handler
+	cmds.AddHandler("register", handlerRegister)   // Register the new handler
+	cmds.AddHandler("reset", handlerReset)         // Register the reset handler
+	cmds.AddHandler("users", handlerUsers)         // Register the users handler
+	cmds.AddHandler("agg", handlerAgg)             // Register the agg handler
+	cmds.AddHandler("addfeed", handlerAddFeed)     // Register the addfeed handler
+	cmds.AddHandler("feeds", handlerFeeds)         // Register the feeds handler
+	cmds.AddHandler("follow", handlerFollow)       // Register the follow handler
+	cmds.AddHandler("following", handlerFollowing) // Register the following handler
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
