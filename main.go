@@ -104,6 +104,35 @@ func handlerRegister(state *State, command Command) error {
 	return nil
 }
 
+// handlerReset implements the "reset" command. It deletes all users from the users table and resets the current user in the config.
+func handlerReset(state *State, command Command) error {
+	// Get all users from the database
+	users, err := state.Queries.ListUsers(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to retrieve users: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Delete each user using the DeleteUser query
+	for _, user := range users {
+		err := state.Queries.DeleteUser(context.Background(), user.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to delete user '%s': %v\n", user.Name, err)
+			os.Exit(1)
+		}
+	}
+
+	// Clear the current user from the config
+	err = state.Config.SetUser("")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to clear current user in config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Reset successful. All users deleted.\n")
+	return nil
+}
+
 func main() {
 	cfg, err := config.ReadConfig()
 	if err != nil {
@@ -126,7 +155,7 @@ func main() {
 	}
 	cmds.AddHandler("login", handlerLogin)
 	cmds.AddHandler("register", handlerRegister) // Register the new handler
-
+	cmds.AddHandler("reset", handlerReset)       // Register the reset handler
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
