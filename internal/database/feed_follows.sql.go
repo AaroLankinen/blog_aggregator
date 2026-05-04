@@ -45,6 +45,71 @@ func (q *Queries) CreateFeedFollow(ctx context.Context, arg CreateFeedFollowPara
 	return i, err
 }
 
+const deleteFeedFollow = `-- name: DeleteFeedFollow :exec
+DELETE FROM feed_follows WHERE user_id = $1 AND feed_id = $2
+`
+
+type DeleteFeedFollowParams struct {
+	UserID uuid.UUID
+	FeedID uuid.UUID
+}
+
+func (q *Queries) DeleteFeedFollow(ctx context.Context, arg DeleteFeedFollowParams) error {
+	_, err := q.db.ExecContext(ctx, deleteFeedFollow, arg.UserID, arg.FeedID)
+	return err
+}
+
+const getFeedFollowByFeedID = `-- name: GetFeedFollowByFeedID :one
+SELECT id, created_at, updated_at, user_id, feed_id FROM feed_follows WHERE feed_id = $1
+`
+
+func (q *Queries) GetFeedFollowByFeedID(ctx context.Context, feedID uuid.UUID) (FeedFollow, error) {
+	row := q.db.QueryRowContext(ctx, getFeedFollowByFeedID, feedID)
+	var i FeedFollow
+	err := row.Scan(
+		&i.ID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.UserID,
+		&i.FeedID,
+	)
+	return i, err
+}
+
+const getFeedFollowByID = `-- name: GetFeedFollowByID :one
+SELECT id, created_at, updated_at, user_id, feed_id FROM feed_follows WHERE id = $1
+`
+
+func (q *Queries) GetFeedFollowByID(ctx context.Context, id uuid.UUID) (FeedFollow, error) {
+	row := q.db.QueryRowContext(ctx, getFeedFollowByID, id)
+	var i FeedFollow
+	err := row.Scan(
+		&i.ID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.UserID,
+		&i.FeedID,
+	)
+	return i, err
+}
+
+const getFeedFollowByUserID = `-- name: GetFeedFollowByUserID :one
+SELECT id, created_at, updated_at, user_id, feed_id FROM feed_follows WHERE user_id = $1
+`
+
+func (q *Queries) GetFeedFollowByUserID(ctx context.Context, userID uuid.UUID) (FeedFollow, error) {
+	row := q.db.QueryRowContext(ctx, getFeedFollowByUserID, userID)
+	var i FeedFollow
+	err := row.Scan(
+		&i.ID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.UserID,
+		&i.FeedID,
+	)
+	return i, err
+}
+
 const getFeedFollowsForUser = `-- name: GetFeedFollowsForUser :many
 SELECT
     feed_follows.id, feed_follows.created_at, feed_follows.updated_at, feed_follows.user_id, feed_follows.feed_id,

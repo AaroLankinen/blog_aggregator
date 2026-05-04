@@ -335,6 +335,35 @@ func handlerFollow(state *State, command Command, user database.User) error {
 	return nil
 }
 
+// handlerUnfollow implements the "unfollow" command. It deletes a feed follow record for the current user.
+func handlerUnfollow(state *State, command Command, user database.User) error {
+	if len(command.Args) < 1 {
+		return fmt.Errorf("usage: unfollow <url>")
+	}
+
+	feedURL := command.Args[0]
+
+	feed, err := state.Queries.GetFeedByURL(context.Background(), feedURL)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			fmt.Fprintf(os.Stderr, "error: feed with URL '%s' not found\n", feedURL)
+			os.Exit(1)
+		}
+		return fmt.Errorf("failed to lookup feed: %w", err)
+	}
+
+	err = state.Queries.DeleteFeedFollow(context.Background(), database.DeleteFeedFollowParams{
+		UserID: user.ID,
+		FeedID: feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete feed follow: %w", err)
+	}
+
+	fmt.Printf("Feed '%s' unfollowed by '%s'\n", feed.Name, user.Name)
+	return nil
+}
+
 // handlerFollowing implements the "following" command. It displays all feeds the current user is following.
 func handlerFollowing(state *State, command Command, user database.User) error {
 	follows, err := state.Queries.GetFeedFollowsForUser(context.Background(), user.ID)
@@ -384,6 +413,7 @@ func main() {
 	cmds.AddHandler("feeds", handlerFeeds)
 	cmds.AddHandler("addfeed", middlewareLoggedIn(handlerAddFeed))
 	cmds.AddHandler("follow", middlewareLoggedIn(handlerFollow))
+	cmds.AddHandler("unfollow", middlewareLoggedIn(handlerUnfollow))
 	cmds.AddHandler("following", middlewareLoggedIn(handlerFollowing))
 	state := &State{
 		Config:   &cfg,
