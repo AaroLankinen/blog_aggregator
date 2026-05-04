@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/xml"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings" // Added for error checking
 	"time"    // Added for current time
@@ -29,6 +32,25 @@ type Command struct {
 
 type Commands struct {
 	Handlers map[string]func(*State, Command) error
+}
+
+type RSSFeed struct {
+	XMLName xml.Name   `xml:"rss"`
+	Channel RSSChannel `xml:"channel"`
+}
+
+type RSSChannel struct {
+	Title       string    `xml:"title"`
+	Link        string    `xml:"link"`
+	Description string    `xml:"description"`
+	Items       []RSSItem `xml:"item"`
+}
+
+type RSSItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
 }
 
 func (c *Commands) AddHandler(name string, handler func(*State, Command) error) {
@@ -157,6 +179,49 @@ func handlerUsers(state *State, command Command) error {
 	return nil
 }
 
+// fetchFeed fetches and parses an RSS feed from the given URL.
+func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch feed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	var feed RSSFeed
+	err = xml.Unmarshal(body, &feed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse XML: %w", err)
+	}
+
+	return &feed, nil
+}
+
+// handlerAgg implements the "agg" command. It fetches and displays an RSS feed.
+func handlerAgg(state *State, command Command) error {
+	feed, err := fetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Feed: %+v\n", feed)
+	return nil
+}
+
 func main() {
 	cfg, err := config.ReadConfig()
 	if err != nil {
@@ -181,6 +246,7 @@ func main() {
 	cmds.AddHandler("register", handlerRegister) // Register the new handler
 	cmds.AddHandler("reset", handlerReset)       // Register the reset handler
 	cmds.AddHandler("users", handlerUsers)       // Register the users handler
+	cmds.AddHandler("agg", handlerAgg)           // Register the agg handler
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
