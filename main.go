@@ -133,6 +133,30 @@ func handlerReset(state *State, command Command) error {
 	return nil
 }
 
+// handlerUsers implements the "users" command. It displays all users in the database, marking the current user.
+func handlerUsers(state *State, command Command) error {
+	users, err := state.Queries.ListUsers(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to retrieve users: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(users) == 0 {
+		fmt.Println("No users found.")
+		return nil
+	}
+
+	currentUser := state.Config.GetUser()
+	for _, user := range users {
+		if user.Name == currentUser {
+			fmt.Printf("* %s (current)\n", user.Name)
+		} else {
+			fmt.Printf("* %s\n", user.Name)
+		}
+	}
+	return nil
+}
+
 func main() {
 	cfg, err := config.ReadConfig()
 	if err != nil {
@@ -156,6 +180,7 @@ func main() {
 	cmds.AddHandler("login", handlerLogin)
 	cmds.AddHandler("register", handlerRegister) // Register the new handler
 	cmds.AddHandler("reset", handlerReset)       // Register the reset handler
+	cmds.AddHandler("users", handlerUsers)       // Register the users handler
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
