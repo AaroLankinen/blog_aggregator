@@ -290,14 +290,21 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 
 // handlerAgg implements the "agg" command. It fetches and displays an RSS feed.
 func handlerAgg(state *State, command Command) error {
-	feed, err := fetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+	if len(command.Args) < 1 {
+		return fmt.Errorf("usage: agg <time_between_reqs>")
 	}
 
-	fmt.Printf("Feed: %+v\n", feed)
-	return nil
+	timeBetweenReqs, err := time.ParseDuration(command.Args[0])
+	if err != nil {
+		return fmt.Errorf("invalid duration: %w", err)
+	}
+
+	fmt.Printf("Collecting feeds every %s\n", timeBetweenReqs)
+
+	ticker := time.NewTicker(timeBetweenReqs)
+	for ; ; <-ticker.C {
+		scrapeFeeds(state)
+	}
 }
 
 // handlerFollow implements the "follow" command. It creates a feed follow record for the current user.
@@ -382,6 +389,28 @@ func handlerFollowing(state *State, command Command, user database.User) error {
 		fmt.Printf("* %s\n", follow.FeedName)
 	}
 	return nil
+}
+
+func scrapeFeeds(state *State) {
+	feeds, err := state.Queries.ListFeeds(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to retrieve feeds for scraping: %v\n", err)
+		return
+	}
+
+	for _, feed := range feeds {
+		fmt.Printf("Scraping feed '%s' at URL '%s'...\n", feed.Name, feed.Url)
+		rssFeed, err := fetchFeed(context.Background(), feed.Url)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to fetch feed '%s': %v\n", feed.Name, err)
+			continue
+		}
+
+		fmt.Printf("Successfully fetched feed '%s' with %d items.\n", feed.Name, len(rssFeed.Channel.Items))
+		for _, item := range rssFeed.Channel.Items {
+			fmt.Printf("  - %s (%s)\n", item.Title, item.Link)
+		}
+	}
 }
 
 // main is the entry point of the application.
