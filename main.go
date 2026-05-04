@@ -70,6 +70,22 @@ func (c *Commands) Handle(state *State, command Command) error {
 	return handler(state, command)
 }
 
+func middlewareLoggedIn(handler func(s *State, cmd Command, user database.User) error) func(*State, Command) error {
+	return func(s *State, cmd Command) error {
+		username := s.Config.GetUser()
+		if username == "" {
+			return fmt.Errorf("no current user configured")
+		}
+
+		user, err := s.Queries.GetUserByName(context.Background(), username)
+		if err != nil {
+			return fmt.Errorf("failed to lookup current user: %w", err)
+		}
+
+		return handler(s, cmd, user)
+	}
+}
+
 func handlerLogin(state *State, command Command) error {
 	if len(command.Args) < 1 {
 		return fmt.Errorf("username is required")
@@ -180,26 +196,13 @@ func handlerUsers(state *State, command Command) error {
 }
 
 // handlerAddFeed implements the "addfeed" command. It creates a new feed for the current user.
-func handlerAddFeed(state *State, command Command) error {
+func handlerAddFeed(state *State, command Command, user database.User) error {
 	if len(command.Args) < 2 {
 		return fmt.Errorf("usage: addfeed <name> <url>")
 	}
 
 	feedName := command.Args[0]
 	feedURL := command.Args[1]
-
-	currentUserName := state.Config.GetUser()
-	if currentUserName == "" {
-		return fmt.Errorf("no current user configured")
-	}
-
-	user, err := state.Queries.GetUserByName(context.Background(), currentUserName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("current user '%s' not found", currentUserName)
-		}
-		return fmt.Errorf("failed to lookup current user: %w", err)
-	}
 
 	now := time.Now().UTC()
 	id := uuid.New()
@@ -298,27 +301,12 @@ func handlerAgg(state *State, command Command) error {
 }
 
 // handlerFollow implements the "follow" command. It creates a feed follow record for the current user.
-func handlerFollow(state *State, command Command) error {
+func handlerFollow(state *State, command Command, user database.User) error {
 	if len(command.Args) < 1 {
 		return fmt.Errorf("usage: follow <url>")
 	}
 
 	feedURL := command.Args[0]
-
-	currentUserName := state.Config.GetUser()
-	if currentUserName == "" {
-		fmt.Fprintln(os.Stderr, "error: no current user configured")
-		os.Exit(1)
-	}
-
-	user, err := state.Queries.GetUserByName(context.Background(), currentUserName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			fmt.Fprintf(os.Stderr, "error: current user '%s' not found\n", currentUserName)
-			os.Exit(1)
-		}
-		return fmt.Errorf("failed to lookup current user: %w", err)
-	}
 
 	feed, err := state.Queries.GetFeedByURL(context.Background(), feedURL)
 	if err != nil {
@@ -348,20 +336,7 @@ func handlerFollow(state *State, command Command) error {
 }
 
 // handlerFollowing implements the "following" command. It displays all feeds the current user is following.
-func handlerFollowing(state *State, command Command) error {
-	currentUserName := state.Config.GetUser()
-	if currentUserName == "" {
-		return fmt.Errorf("no current user configured")
-	}
-
-	user, err := state.Queries.GetUserByName(context.Background(), currentUserName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("current user '%s' not found", currentUserName)
-		}
-		return fmt.Errorf("failed to lookup current user: %w", err)
-	}
-
+func handlerFollowing(state *State, command Command, user database.User) error {
 	follows, err := state.Queries.GetFeedFollowsForUser(context.Background(), user.ID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to retrieve feed follows: %v\n", err)
@@ -373,7 +348,7 @@ func handlerFollowing(state *State, command Command) error {
 		return nil
 	}
 
-	fmt.Printf("Feeds followed by %s:\n", currentUserName)
+	fmt.Printf("Feeds followed by %s:\n", user.Name)
 	for _, follow := range follows {
 		fmt.Printf("* %s\n", follow.FeedName)
 	}
@@ -402,14 +377,14 @@ func main() {
 		Handlers: make(map[string]func(*State, Command) error),
 	}
 	cmds.AddHandler("login", handlerLogin)
-	cmds.AddHandler("register", handlerRegister)   // Register the new handler
-	cmds.AddHandler("reset", handlerReset)         // Register the reset handler
-	cmds.AddHandler("users", handlerUsers)         // Register the users handler
-	cmds.AddHandler("agg", handlerAgg)             // Register the agg handler
-	cmds.AddHandler("addfeed", handlerAddFeed)     // Register the addfeed handler
-	cmds.AddHandler("feeds", handlerFeeds)         // Register the feeds handler
-	cmds.AddHandler("follow", handlerFollow)       // Register the follow handler
-	cmds.AddHandler("following", handlerFollowing) // Register the following handler
+	cmds.AddHandler("register", handlerRegister)
+	cmds.AddHandler("reset", handlerReset)
+	cmds.AddHandler("users", handlerUsers)
+	cmds.AddHandler("agg", handlerAgg)
+	cmds.AddHandler("feeds", handlerFeeds)
+	cmds.AddHandler("addfeed", middlewareLoggedIn(handlerAddFeed))
+	cmds.AddHandler("follow", middlewareLoggedIn(handlerFollow))
+	cmds.AddHandler("following", middlewareLoggedIn(handlerFollowing))
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
