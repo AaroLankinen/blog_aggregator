@@ -179,6 +179,77 @@ func handlerUsers(state *State, command Command) error {
 	return nil
 }
 
+// handlerAddFeed implements the "addfeed" command. It creates a new feed for the current user.
+func handlerAddFeed(state *State, command Command) error {
+	if len(command.Args) < 2 {
+		return fmt.Errorf("usage: addfeed <name> <url>")
+	}
+
+	feedName := command.Args[0]
+	feedURL := command.Args[1]
+
+	currentUserName := state.Config.GetUser()
+	if currentUserName == "" {
+		fmt.Fprintln(os.Stderr, "error: no current user configured")
+		os.Exit(1)
+	}
+
+	user, err := state.Queries.GetUserByName(context.Background(), currentUserName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			fmt.Fprintf(os.Stderr, "error: current user '%s' not found\n", currentUserName)
+			os.Exit(1)
+		}
+		return fmt.Errorf("failed to lookup current user: %w", err)
+	}
+
+	now := time.Now().UTC()
+	id := uuid.New()
+
+	feed, err := state.Queries.CreateFeed(context.Background(), database.CreateFeedParams{
+		ID:        id,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Name:      feedName,
+		Url:       feedURL,
+		UserID:    user.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create feed: %w", err)
+	}
+
+	fmt.Printf("Feed created successfully: %+v\n", feed)
+	return nil
+}
+
+// handlerFeeds implements the "feeds" command. It displays all feeds in the database.
+func handlerFeeds(state *State, command Command) error {
+	feeds, err := state.Queries.ListFeeds(context.Background())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to retrieve feeds: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(feeds) == 0 {
+		fmt.Println("No feeds found.")
+		return nil
+	}
+
+	for _, feed := range feeds {
+		user, err := state.Queries.GetUserByID(context.Background(), feed.UserID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: failed to get user for feed '%s': %v\n", feed.Name, err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("* %s\n", feed.Name)
+		fmt.Printf("  URL: %s\n", feed.Url)
+		fmt.Printf("  User: %s\n", user.Name)
+		fmt.Println()
+	}
+	return nil
+}
+
 // fetchFeed fetches and parses an RSS feed from the given URL.
 func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
@@ -222,6 +293,7 @@ func handlerAgg(state *State, command Command) error {
 	return nil
 }
 
+// main is the entry point of the application.
 func main() {
 	cfg, err := config.ReadConfig()
 	if err != nil {
@@ -247,6 +319,8 @@ func main() {
 	cmds.AddHandler("reset", handlerReset)       // Register the reset handler
 	cmds.AddHandler("users", handlerUsers)       // Register the users handler
 	cmds.AddHandler("agg", handlerAgg)           // Register the agg handler
+	cmds.AddHandler("addfeed", handlerAddFeed)   // Register the addfeed handler
+	cmds.AddHandler("feeds", handlerFeeds)       // Register the feeds handler
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
