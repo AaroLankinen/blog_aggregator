@@ -8,11 +8,13 @@ import (
 
 const configFileName = ".gatorconfig.json"
 
+// Config holds persistent application settings stored in the user's home directory.
 type Config struct {
 	DBURL           string `json:"db_url"`
 	CurrentUserName string `json:"current_user_name"`
 }
 
+// ReadConfig loads configuration from the ~/.gatorconfig.json file.
 func ReadConfig() (Config, error) {
 	path, err := getConfigFilePath()
 	if err != nil {
@@ -32,20 +34,24 @@ func ReadConfig() (Config, error) {
 	return cfg, nil
 }
 
+// SetUser updates the current user and persists the config file.
 func (c *Config) SetUser(username string) error {
 	c.CurrentUserName = username
 	return writeConfig(*c)
 }
 
+// SetDBURL updates the database connection URL and persists the config file.
 func (c *Config) SetDBURL(url string) error {
 	c.DBURL = url
 	return writeConfig(*c)
 }
 
+// GetUser returns the configured current user name.
 func (c *Config) GetUser() string {
 	return c.CurrentUserName
 }
 
+// GetDBURL returns the configured database connection URL.
 func (c *Config) GetDBURL() string {
 	return c.DBURL
 }

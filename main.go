@@ -4,42 +4,56 @@ import (
 	"context"
 	"database/sql"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
-	"strings" // Added for error checking
-	"time"    // Added for current time
+	"strings"
+	"sync"
+	"time"
 
 	config "github.com/AaroLankinen/blog_aggregator/internal/config"
-	"github.com/AaroLankinen/blog_aggregator/internal/database" // Assuming sqlc generated code is here
-	"github.com/google/uuid"                                    // Added for UUID generation
+	"github.com/AaroLankinen/blog_aggregator/internal/database"
+	"github.com/google/uuid"
+	"github.com/peterh/liner"
 
 	_ "github.com/lib/pq"
 )
 
+// State holds the runtime state for the application, including config, database queries, and command routing.
 type State struct {
-	Config   *config.Config
-	Commands *Commands
-	DB       *sql.DB           // Added: Database connection
-	Queries  *database.Queries // Added: SQLC generated queries
+	Config     *config.Config
+	Commands   *Commands
+	DB         *sql.DB
+	Queries    *database.Queries
+	aggMutex   sync.Mutex
+	aggRunning bool
+	aggStop    chan struct{}
+	aggDone    chan struct{}
 }
 
+// Command represents a user-invoked command with arguments.
 type Command struct {
 	Name string
 	Args []string
 }
 
+// Commands dispatches command names to handler functions.
 type Commands struct {
 	Handlers map[string]func(*State, Command) error
 }
 
+// RSSFeed mirrors the RSS XML root structure for parsing feeds.
 type RSSFeed struct {
 	XMLName xml.Name   `xml:"rss"`
 	Channel RSSChannel `xml:"channel"`
 }
 
+// RSSChannel contains feed metadata and item entries.
 type RSSChannel struct {
 	Title       string    `xml:"title"`
 	Link        string    `xml:"link"`
@@ -47,6 +61,7 @@ type RSSChannel struct {
 	Items       []RSSItem `xml:"item"`
 }
 
+// RSSItem represents a single RSS entry that will be turned into a stored post.
 type RSSItem struct {
 	Title       string `xml:"title"`
 	Link        string `xml:"link"`
@@ -63,6 +78,8 @@ func (c *Commands) GetHandler(name string) (func(*State, Command) error, bool) {
 	return handler, exists
 }
 
+var ErrExit = errors.New("exit")
+
 func (c *Commands) Handle(state *State, command Command) error {
 	handler, exists := c.GetHandler(command.Name)
 	if !exists {
@@ -71,6 +88,132 @@ func (c *Commands) Handle(state *State, command Command) error {
 	return handler(state, command)
 }
 
+func parseCommand(line string) Command {
+	parts := strings.Fields(strings.TrimSpace(line))
+	if len(parts) == 0 {
+		return Command{}
+	}
+	return Command{Name: parts[0], Args: parts[1:]}
+}
+
+func getHistoryPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".blog_aggregator_history"), nil
+}
+
+func runREPL(state *State) error {
+	line := liner.NewLiner()
+	defer line.Close()
+	line.SetCtrlCAborts(true)
+
+	historyPath, err := getHistoryPath()
+	if err == nil {
+		if f, err := os.Open(historyPath); err == nil {
+			line.ReadHistory(f)
+			f.Close()
+		}
+	}
+
+	fmt.Println("Blog Aggregator. Type 'usage' for commands.")
+	for {
+		input, err := line.Prompt("> ")
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err == liner.ErrPromptAborted {
+				continue
+			}
+			return err
+		}
+
+		trimmed := strings.TrimSpace(input)
+		if trimmed == "" {
+			continue
+		}
+
+		line.AppendHistory(trimmed)
+		if historyPath != "" {
+			if f, err := os.Create(historyPath); err == nil {
+				line.WriteHistory(f)
+				f.Close()
+			}
+		}
+
+		command := parseCommand(trimmed)
+		if command.Name == "" {
+			continue
+		}
+
+		err = state.Commands.Handle(state, command)
+		if err != nil {
+			if errors.Is(err, ErrExit) {
+				if stopErr := stopAggregator(state); stopErr != nil {
+					fmt.Fprintf(os.Stderr, "error stopping aggregator: %v\n", stopErr)
+				}
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		}
+	}
+}
+
+func startAggregator(state *State, interval time.Duration) error {
+	state.aggMutex.Lock()
+	defer state.aggMutex.Unlock()
+	if state.aggRunning {
+		return fmt.Errorf("aggregator already running")
+	}
+
+	state.aggStop = make(chan struct{})
+	state.aggDone = make(chan struct{})
+	state.aggRunning = true
+
+	go func() {
+		defer func() {
+			state.aggMutex.Lock()
+			state.aggRunning = false
+			close(state.aggDone)
+			state.aggMutex.Unlock()
+		}()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			scrapeFeeds(state)
+			select {
+			case <-ticker.C:
+				continue
+			case <-state.aggStop:
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+func stopAggregator(state *State) error {
+	state.aggMutex.Lock()
+	if !state.aggRunning {
+		state.aggMutex.Unlock()
+		return fmt.Errorf("aggregator is not running")
+	}
+
+	close(state.aggStop)
+	done := state.aggDone
+	state.aggMutex.Unlock()
+
+	<-done
+	return nil
+}
+
+// middlewareLoggedIn wraps a command handler and ensures a user is currently configured.
+// It looks up the current user from config and passes that user to the wrapped handler.
 func middlewareLoggedIn(handler func(s *State, cmd Command, user database.User) error) func(*State, Command) error {
 	return func(s *State, cmd Command) error {
 		username := s.Config.GetUser()
@@ -96,8 +239,7 @@ func handlerLogin(state *State, command Command) error {
 	user, err := state.Queries.GetUserByName(context.Background(), username)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			fmt.Fprintf(os.Stderr, "error: user '%s' not found\n", username)
-			os.Exit(1)
+			return fmt.Errorf("user '%s' not found", username)
 		}
 		return fmt.Errorf("failed to retrieve user '%s': %w", username, err)
 	}
@@ -127,8 +269,7 @@ func handlerRegister(state *State, command Command) error {
 	if err != nil {
 		// Check for unique constraint violation on the name field
 		if strings.Contains(err.Error(), "duplicate key value") && strings.Contains(err.Error(), "users_name_key") {
-			fmt.Fprintf(os.Stderr, "error: user with name '%s' already exists\n", username)
-			os.Exit(1)
+			return fmt.Errorf("user with name '%s' already exists", username)
 		}
 		return fmt.Errorf("failed to create user: %w", err)
 	}
@@ -145,30 +286,24 @@ func handlerRegister(state *State, command Command) error {
 
 // handlerReset implements the "reset" command. It deletes all users from the users table and resets the current user in the config.
 func handlerReset(state *State, command Command) error {
-	// Get all users from the database
 	users, err := state.Queries.ListUsers(context.Background())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to retrieve users: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to retrieve users: %w", err)
 	}
 
-	// Delete each user using the DeleteUser query
 	for _, user := range users {
 		err := state.Queries.DeleteUser(context.Background(), user.ID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to delete user '%s': %v\n", user.Name, err)
-			os.Exit(1)
+			return fmt.Errorf("failed to delete user '%s': %w", user.Name, err)
 		}
 	}
 
-	// Clear the current user from the config
 	err = state.Config.SetUser("")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to clear current user in config: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to clear current user in config: %w", err)
 	}
 
-	fmt.Printf("Reset successful. All users deleted.\n")
+	fmt.Println("Reset successful. All users deleted.")
 	return nil
 }
 
@@ -176,8 +311,7 @@ func handlerReset(state *State, command Command) error {
 func handlerUsers(state *State, command Command) error {
 	users, err := state.Queries.ListUsers(context.Background())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to retrieve users: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to retrieve users: %w", err)
 	}
 
 	if len(users) == 0 {
@@ -240,8 +374,7 @@ func handlerAddFeed(state *State, command Command, user database.User) error {
 func handlerFeeds(state *State, command Command) error {
 	feeds, err := state.Queries.GetFeedsWithUser(context.Background())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to retrieve feeds: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to retrieve feeds: %w", err)
 	}
 
 	if len(feeds) == 0 {
@@ -289,7 +422,7 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &feed, nil
 }
 
-// handlerAgg implements the "agg" command. It fetches and displays an RSS feed.
+// handlerAgg implements the "agg" command. It starts the background aggregator that fetches feeds every interval.
 func handlerAgg(state *State, command Command) error {
 	if len(command.Args) < 1 {
 		return fmt.Errorf("usage: agg <time_between_reqs>")
@@ -299,13 +432,47 @@ func handlerAgg(state *State, command Command) error {
 	if err != nil {
 		return fmt.Errorf("invalid duration: %w", err)
 	}
-
-	fmt.Printf("Collecting feeds every %s\n", timeBetweenReqs)
-
-	ticker := time.NewTicker(timeBetweenReqs)
-	for ; ; <-ticker.C {
-		scrapeFeeds(state)
+	if timeBetweenReqs <= 0 {
+		return fmt.Errorf("interval must be positive")
 	}
+
+	if err := startAggregator(state, timeBetweenReqs); err != nil {
+		return err
+	}
+
+	fmt.Printf("Aggregator started: fetching every %s\n", timeBetweenReqs)
+	return nil
+}
+
+// handlerStop implements the "stop" command. It stops the background aggregator if running.
+func handlerStop(state *State, command Command) error {
+	if err := stopAggregator(state); err != nil {
+		return err
+	}
+
+	fmt.Println("Aggregator stopped.")
+	return nil
+}
+
+// handlerUsage implements the "usage" command, listing available commands.
+func handlerUsage(state *State, command Command) error {
+	commands := make([]string, 0, len(state.Commands.Handlers))
+	for name := range state.Commands.Handlers {
+		commands = append(commands, name)
+	}
+	sort.Strings(commands)
+
+	fmt.Println("Available commands:")
+	for _, name := range commands {
+		fmt.Printf("  %s\n", name)
+	}
+	fmt.Println("Type a command and press Enter.")
+	return nil
+}
+
+// handlerExit implements the "exit" command. It stops the current aggregator and exits the REPL.
+func handlerExit(state *State, command Command) error {
+	return ErrExit
 }
 
 // handlerFollow implements the "follow" command. It creates a feed follow record for the current user.
@@ -319,8 +486,7 @@ func handlerFollow(state *State, command Command, user database.User) error {
 	feed, err := state.Queries.GetFeedByURL(context.Background(), feedURL)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			fmt.Fprintf(os.Stderr, "error: feed with URL '%s' not found\n", feedURL)
-			os.Exit(1)
+			return fmt.Errorf("feed with URL '%s' not found", feedURL)
 		}
 		return fmt.Errorf("failed to lookup feed: %w", err)
 	}
@@ -354,8 +520,7 @@ func handlerUnfollow(state *State, command Command, user database.User) error {
 	feed, err := state.Queries.GetFeedByURL(context.Background(), feedURL)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			fmt.Fprintf(os.Stderr, "error: feed with URL '%s' not found\n", feedURL)
-			os.Exit(1)
+			return fmt.Errorf("feed with URL '%s' not found", feedURL)
 		}
 		return fmt.Errorf("failed to lookup feed: %w", err)
 	}
@@ -376,8 +541,7 @@ func handlerUnfollow(state *State, command Command, user database.User) error {
 func handlerFollowing(state *State, command Command, user database.User) error {
 	follows, err := state.Queries.GetFeedFollowsForUser(context.Background(), user.ID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to retrieve feed follows: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to retrieve feed follows: %w", err)
 	}
 
 	if len(follows) == 0 {
@@ -441,55 +605,64 @@ func handlerBrowse(state *State, command Command, user database.User) error {
 	return nil
 }
 
+// scrapeFeeds selects the next feed that is due for refresh, marks it as fetched,
+// downloads the RSS feed, and stores new posts in the database.
 func scrapeFeeds(state *State) {
-	feed, err := state.Queries.GetNextFeedToFetch(context.Background())
+	feeds, err := state.Queries.GetFeedsToFetch(context.Background())
 	if err != nil {
-		fmt.Printf("Couldn't get next feed to scrape: %v\n", err)
+		fmt.Printf("Couldn't get feeds to scrape: %v\n", err)
 		return
 	}
 
-	err = state.Queries.MarkFeedFetched(context.Background(), database.MarkFeedFetchedParams{
-		LastFetchedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
-		ID:            feed.ID,
-	})
-	if err != nil {
-		fmt.Printf("Couldn't mark feed %s as fetched: %v\n", feed.Name, err)
+	if len(feeds) == 0 {
 		return
 	}
 
-	rssFeed, err := fetchFeed(context.Background(), feed.Url)
-	if err != nil {
-		fmt.Printf("Couldn't fetch feed %s: %v\n", feed.Name, err)
-		return
-	}
-
-	for _, item := range rssFeed.Channel.Items {
-		pubAt := time.Now().UTC()
-		if t, err := parseTime(item.PubDate); err == nil {
-			pubAt = t
-		}
-
-		_, err = state.Queries.CreatePost(context.Background(), database.CreatePostParams{
-			ID:          uuid.New(),
-			CreatedAt:   time.Now().UTC(),
-			UpdatedAt:   time.Now().UTC(),
-			Title:       item.Title,
-			Url:         item.Link,
-			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
-			PublishedAt: pubAt,
-			FeedID:      feed.ID,
+	for _, feed := range feeds {
+		err = state.Queries.MarkFeedFetched(context.Background(), database.MarkFeedFetchedParams{
+			LastFetchedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+			ID:            feed.ID,
 		})
 		if err != nil {
-			if strings.Contains(err.Error(), "duplicate key value") {
-				continue
-			}
-			fmt.Printf("Couldn't create post: %v\n", err)
+			fmt.Printf("Couldn't mark feed %s as fetched: %v\n", feed.Name, err)
+			continue
 		}
+
+		rssFeed, err := fetchFeed(context.Background(), feed.Url)
+		if err != nil {
+			fmt.Printf("Couldn't fetch feed %s: %v\n", feed.Name, err)
+			continue
+		}
+
+		for _, item := range rssFeed.Channel.Items {
+			pubAt := time.Now().UTC()
+			if t, err := parseTime(item.PubDate); err == nil {
+				pubAt = t
+			}
+
+			_, err = state.Queries.CreatePost(context.Background(), database.CreatePostParams{
+				ID:          uuid.New(),
+				CreatedAt:   time.Now().UTC(),
+				UpdatedAt:   time.Now().UTC(),
+				Title:       item.Title,
+				Url:         item.Link,
+				Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+				PublishedAt: pubAt,
+				FeedID:      feed.ID,
+			})
+			if err != nil {
+				if strings.Contains(err.Error(), "duplicate key value") {
+					continue
+				}
+				fmt.Printf("Couldn't create post: %v\n", err)
+			}
+		}
+		fmt.Printf("Feed %s collected, %d posts found\n", feed.Name, len(rssFeed.Channel.Items))
 	}
-	fmt.Printf("Feed %s collected, %d posts found\n", feed.Name, len(rssFeed.Channel.Items))
 }
 
-// main is the entry point of the application.
+// main is the application entry point. It initializes configuration, opens the database,
+// registers command handlers, and dispatches the user command.
 func main() {
 	cfg, err := config.ReadConfig()
 	if err != nil {
@@ -515,6 +688,9 @@ func main() {
 	cmds.AddHandler("reset", handlerReset)
 	cmds.AddHandler("users", handlerUsers)
 	cmds.AddHandler("agg", handlerAgg)
+	cmds.AddHandler("stop", handlerStop)
+	cmds.AddHandler("usage", handlerUsage)
+	cmds.AddHandler("exit", handlerExit)
 	cmds.AddHandler("feeds", handlerFeeds)
 	cmds.AddHandler("addfeed", middlewareLoggedIn(handlerAddFeed))
 	cmds.AddHandler("follow", middlewareLoggedIn(handlerFollow))
@@ -524,22 +700,22 @@ func main() {
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
-		DB:       db,      // Pass DB connection to state
-		Queries:  queries, // Pass queries object to state
+		DB:       db,
+		Queries:  queries,
 	}
 
-	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "usage: %s <command> [args...]\n", os.Args[0])
-		os.Exit(1)
+	if len(os.Args) > 1 {
+		cmd := parseCommand(strings.Join(os.Args[1:], " "))
+		err = state.Commands.Handle(state, cmd)
+		if err != nil {
+			if errors.Is(err, ErrExit) {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		}
 	}
 
-	cmd := Command{
-		Name: os.Args[1],
-		Args: os.Args[2:],
-	}
-
-	err = state.Commands.Handle(state, cmd)
-	if err != nil {
+	if err := runREPL(state); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}

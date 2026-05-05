@@ -26,6 +26,11 @@ WHERE last_fetched_at IS NULL OR last_fetched_at < NOW() - INTERVAL '1 hour'
 ORDER BY last_fetched_at ASC
 LIMIT 1;
 
+-- name: GetFeedsToFetch :many
+SELECT * FROM feeds
+WHERE last_fetched_at IS NULL OR last_fetched_at < NOW() - INTERVAL '1 hour'
+ORDER BY last_fetched_at ASC;
+
 -- name: UpdateFeed :exec
 UPDATE feeds SET name = $1, url = $2 WHERE id = $3;
 
