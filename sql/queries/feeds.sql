@@ -17,7 +17,7 @@ SELECT * FROM feeds WHERE url = $1;
 -- name: GetFeedByID :one
 SELECT * FROM feeds WHERE id = $1;
 
---name: MarkFeedFetched :exec
+-- name: MarkFeedFetched :exec
 UPDATE feeds SET last_fetched_at = $1 WHERE id = $2;
 
 -- name: GetNextFeedToFetch :one

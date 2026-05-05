@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings" // Added for error checking
 	"time"    // Added for current time
 
@@ -391,26 +392,101 @@ func handlerFollowing(state *State, command Command, user database.User) error {
 	return nil
 }
 
-func scrapeFeeds(state *State) {
-	feeds, err := state.Queries.ListFeeds(context.Background())
+func parseTime(s string) (time.Time, error) {
+	formats := []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		time.RFC822Z,
+		time.RFC822,
+	}
+	for _, f := range formats {
+		t, err := time.Parse(f, s)
+		if err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("could not parse time: %s", s)
+}
+
+// handlerBrowse implements the "browse" command. It displays recent posts from feeds the current user is following.
+// It accepts an optional argument for the number of posts to display (default is 2).
+func handlerBrowse(state *State, command Command, user database.User) error {
+	limit := 2
+	if len(command.Args) > 0 {
+		if l, err := strconv.Atoi(command.Args[0]); err == nil {
+			limit = l
+		} else {
+			return fmt.Errorf("invalid limit: %w", err)
+		}
+	}
+
+	posts, err := state.Queries.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  int32(limit),
+		Offset: 0,
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to retrieve feeds for scraping: %v\n", err)
+		return fmt.Errorf("failed to get posts: %w", err)
+	}
+
+	fmt.Printf("Found %d posts for user %s:\n", len(posts), user.Name)
+	for _, post := range posts {
+		fmt.Printf("%s from %s\n", post.PublishedAt.Format("Mon Jan _2"), post.FeedName)
+		fmt.Printf("--- %s ---\n", post.Title)
+		fmt.Printf("    %v\n", post.Description.String)
+		fmt.Printf("    Link: %s\n", post.Url)
+		fmt.Println("----------------------------------------------")
+	}
+
+	return nil
+}
+
+func scrapeFeeds(state *State) {
+	feed, err := state.Queries.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		fmt.Printf("Couldn't get next feed to scrape: %v\n", err)
 		return
 	}
 
-	for _, feed := range feeds {
-		fmt.Printf("Scraping feed '%s' at URL '%s'...\n", feed.Name, feed.Url)
-		rssFeed, err := fetchFeed(context.Background(), feed.Url)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to fetch feed '%s': %v\n", feed.Name, err)
-			continue
+	err = state.Queries.MarkFeedFetched(context.Background(), database.MarkFeedFetchedParams{
+		LastFetchedAt: sql.NullTime{Time: time.Now().UTC(), Valid: true},
+		ID:            feed.ID,
+	})
+	if err != nil {
+		fmt.Printf("Couldn't mark feed %s as fetched: %v\n", feed.Name, err)
+		return
+	}
+
+	rssFeed, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		fmt.Printf("Couldn't fetch feed %s: %v\n", feed.Name, err)
+		return
+	}
+
+	for _, item := range rssFeed.Channel.Items {
+		pubAt := time.Now().UTC()
+		if t, err := parseTime(item.PubDate); err == nil {
+			pubAt = t
 		}
 
-		fmt.Printf("Successfully fetched feed '%s' with %d items.\n", feed.Name, len(rssFeed.Channel.Items))
-		for _, item := range rssFeed.Channel.Items {
-			fmt.Printf("  - %s (%s)\n", item.Title, item.Link)
+		_, err = state.Queries.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now().UTC(),
+			UpdatedAt:   time.Now().UTC(),
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			PublishedAt: pubAt,
+			FeedID:      feed.ID,
+		})
+		if err != nil {
+			if strings.Contains(err.Error(), "duplicate key value") {
+				continue
+			}
+			fmt.Printf("Couldn't create post: %v\n", err)
 		}
 	}
+	fmt.Printf("Feed %s collected, %d posts found\n", feed.Name, len(rssFeed.Channel.Items))
 }
 
 // main is the entry point of the application.
@@ -444,6 +520,7 @@ func main() {
 	cmds.AddHandler("follow", middlewareLoggedIn(handlerFollow))
 	cmds.AddHandler("unfollow", middlewareLoggedIn(handlerUnfollow))
 	cmds.AddHandler("following", middlewareLoggedIn(handlerFollowing))
+	cmds.AddHandler("browse", middlewareLoggedIn(handlerBrowse))
 	state := &State{
 		Config:   &cfg,
 		Commands: cmds,
